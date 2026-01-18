@@ -27,6 +27,8 @@ class SmolLM2Config:
     group_size: int = 64
     residual_length: int = 32
     use_kivi: bool = True
+    quantize_prefill: bool = False
+    prefill_use_quantized: bool = False
 
 
 def pre_compute_rope(config: SmolLM2Config) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -106,21 +108,29 @@ class MHA(nn.Module):
     def _maybe_quantize_kv(self, key_states: torch.Tensor, value_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.config.use_kivi:
             return key_states, value_states
+        if not self.config.quantize_prefill:
+            return key_states, value_states
 
         seqlen = key_states.size(2)
         residual_length = self.config.residual_length
         if residual_length is None or residual_length <= 0 or residual_length >= seqlen:
-            return self._quantize_key(key_states), self._quantize_value(value_states)
+            key_quant = self._quantize_key(key_states)
+            value_quant = self._quantize_value(value_states)
+            if self.config.prefill_use_quantized:
+                return key_quant, value_quant
+            return key_states, value_states
 
         quant_len = seqlen - residual_length
         key_quant = self._quantize_key(key_states[:, :, :quant_len, :])
         value_quant = self._quantize_value(value_states[:, :, :quant_len, :])
         key_full = key_states[:, :, quant_len:, :]
         value_full = value_states[:, :, quant_len:, :]
-        return (
-            torch.cat([key_quant, key_full], dim=2),
-            torch.cat([value_quant, value_full], dim=2),
-        )
+        if self.config.prefill_use_quantized:
+            return (
+                torch.cat([key_quant, key_full], dim=2),
+                torch.cat([value_quant, value_full], dim=2),
+            )
+        return key_states, value_states
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, embd = x.shape
@@ -141,10 +151,10 @@ class MHA(nn.Module):
         q = torch.cat((q, qr), dim=-1)
         k = torch.cat((k, kr), dim=-1)
 
+        k, v = self._maybe_quantize_kv(k, v)
+
         k = k.repeat_interleave(self.group_size, dim=1)
         v = v.repeat_interleave(self.group_size, dim=1)
-
-        k, v = self._maybe_quantize_kv(k, v)
 
         if self.attn_implementation == "eager":
             attn_scores = (q @ k.transpose(-1, -2)) * (1.0 / math.sqrt(k.size(-1)))

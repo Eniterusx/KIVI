@@ -91,6 +91,8 @@ def _build_smollm_model(tokenizer, rope_cos: Optional[torch.Tensor], rope_sin: O
         group_size=args.group_size,
         residual_length=args.residual_length,
         use_kivi=True,
+        quantize_prefill=args.quantize_prefill,
+        prefill_use_quantized=args.prefill_use_quantized,
     )
     return SmolLMKIVI(config, tokenizer=tokenizer, rope_cos=rope_cos, rope_sin=rope_sin)
 
@@ -154,6 +156,44 @@ def _evaluate_ppl(model: torch.nn.Module, dataloader: DataLoader, device: torch.
     return avg_loss, bpc, ppl
 
 
+def _evaluate_ppl_autoregressive(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    pad_token_id: int,
+    vocab_size: int,
+    desc: str,
+):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=desc, leave=False):
+            input_ids = batch["input_ids"].to(device)
+            if "label_ids" in batch:
+                labels = batch["label_ids"].to(device)
+            else:
+                labels = input_ids.clone()
+            labels[labels == pad_token_id] = -100
+
+            seq_len = input_ids.size(1)
+            for t in range(1, seq_len):
+                targets = labels[:, t]
+                if (targets != -100).any():
+                    logits = model(input_ids[:, :t])
+                    step_logits = logits[:, -1, :]
+                    loss = loss_fn(step_logits, targets)
+                    total_loss += loss.item()
+                    total_tokens += (targets != -100).sum().item()
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    bpc = avg_loss / math.log(2)
+    ppl = math.exp(avg_loss)
+    return avg_loss, bpc, ppl
+
+
 def _set_kivi_enabled(model: torch.nn.Module, enabled: bool):
     for module in model.modules():
         if hasattr(module, "quant_config") and module.quant_config is not None:
@@ -196,8 +236,15 @@ def run_experiment(model_name: str, dataset: str, args):
 
     print(f"Preparing datasets (block_size={args.block_size})...", flush=True)
     train_dataset, val_dataset, _ = _get_dataset(tokenizer, dataset, args.block_size)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=default_data_collator)
-    val_loader = DataLoader(val_dataset, batch_size=args.eval_batch_size, collate_fn=default_data_collator)
+    train_bs = args.batch_size
+    eval_bs = args.eval_batch_size
+    if model_name == "smollm360":
+        train_bs = max(1, train_bs // 2)
+        eval_bs = max(1, eval_bs // 2)
+        print(f"Using half batch size for SmolLM360: train={train_bs}, eval={eval_bs}", flush=True)
+
+    train_loader = DataLoader(train_dataset, batch_size=train_bs, shuffle=True, collate_fn=default_data_collator)
+    val_loader = DataLoader(val_dataset, batch_size=eval_bs, collate_fn=default_data_collator)
 
     weights_path = _resolve_weights_path(model_name, dataset)
     print(f"Loading weights from {weights_path}", flush=True)
@@ -249,7 +296,11 @@ def run_experiment(model_name: str, dataset: str, args):
 
     print("Evaluating full-precision model (no KIVI)...", flush=True)
     _set_kivi_enabled(model, False)
-    base_loss, base_bpc, base_ppl = _evaluate_ppl(
+    eval_fn = _evaluate_ppl_autoregressive if args.eval_mode == "autoregressive" else _evaluate_ppl
+    epoch_eval_fn = _evaluate_ppl if args.eval_mode == "autoregressive" else eval_fn
+    base_eval_fn = _evaluate_ppl if args.eval_mode == "autoregressive" else eval_fn
+
+    base_loss, base_bpc, base_ppl = base_eval_fn(
         model,
         val_loader,
         device,
@@ -264,7 +315,7 @@ def run_experiment(model_name: str, dataset: str, args):
 
     print("Evaluating quantized model (KIVI enabled)...", flush=True)
     _set_kivi_enabled(model, True)
-    q_loss, q_bpc, q_ppl = _evaluate_ppl(
+    q_loss, q_bpc, q_ppl = base_eval_fn(
         model,
         val_loader,
         device,
@@ -285,7 +336,7 @@ def run_experiment(model_name: str, dataset: str, args):
         train_loss = _train_one_epoch(
             model, train_loader, optimizer, device, tokenizer.pad_token_id, desc=f"Train {model_name}-{dataset} [epoch {epoch + 1}]"
         )
-        val_loss, val_bpc, val_ppl = _evaluate_ppl(
+        val_loss, val_bpc, val_ppl = epoch_eval_fn(
             model,
             val_loader,
             device,
@@ -295,6 +346,20 @@ def run_experiment(model_name: str, dataset: str, args):
         )
         print(
             f"[{model_name}/{dataset}] epoch {epoch + 1}/{args.epochs} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | val ppl {val_ppl:.4f}",
+            flush=True,
+        )
+
+    if args.eval_mode == "autoregressive" and args.epochs > 0:
+        final_loss, final_bpc, final_ppl = _evaluate_ppl_autoregressive(
+            model,
+            val_loader,
+            device,
+            tokenizer.pad_token_id,
+            tokenizer.vocab_size,
+            desc=f"Final AR Eval {model_name}-{dataset}",
+        )
+        print(
+            f"[{model_name}/{dataset}] final autoregressive | val loss {final_loss:.4f} | val ppl {final_ppl:.4f}",
             flush=True,
         )
 
@@ -321,10 +386,13 @@ def parse_args():
     parser.add_argument("--v-bits", type=int, default=2)
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--residual-length", type=int, default=32)
+    parser.add_argument("--quantize-prefill", action="store_true", help="Quantize K/V during prefill (may lower PPL).")
+    parser.add_argument("--prefill-use-quantized", action="store_true", help="Use quantized K/V for attention during prefill.")
     parser.add_argument("--rope-theta", type=int, default=100000)
     parser.add_argument("--attn-implementation", type=str, default="sdpa", choices=["sdpa", "eager"])
     parser.add_argument("--output-dir", type=str, default="outputs/qat")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-mode", choices=["batched", "autoregressive"], default="batched")
     return parser.parse_args()
 
 
