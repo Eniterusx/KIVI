@@ -91,8 +91,6 @@ def _build_smollm_model(tokenizer, rope_cos: Optional[torch.Tensor], rope_sin: O
         group_size=args.group_size,
         residual_length=args.residual_length,
         use_kivi=True,
-        quantize_prefill=args.quantize_prefill,
-        prefill_use_quantized=args.prefill_use_quantized,
     )
     return SmolLMKIVI(config, tokenizer=tokenizer, rope_cos=rope_cos, rope_sin=rope_sin)
 
@@ -187,6 +185,56 @@ def _evaluate_ppl_autoregressive(
                     loss = loss_fn(step_logits, targets)
                     total_loss += loss.item()
                     total_tokens += (targets != -100).sum().item()
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    bpc = avg_loss / math.log(2)
+    ppl = math.exp(avg_loss)
+    return avg_loss, bpc, ppl
+
+
+def _evaluate_ppl_streaming(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    pad_token_id: int,
+    vocab_size: int,
+    desc: str,
+):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=desc, leave=False):
+            input_ids = batch["input_ids"].to(device)
+            if "label_ids" in batch:
+                labels = batch["label_ids"].to(device)
+            else:
+                labels = input_ids.clone()
+            labels[labels == pad_token_id] = -100
+
+            seq_len = input_ids.size(1)
+            past_kv = None
+            
+            # Streaming evaluation: process token by token, maintaining cache
+            for t in range(seq_len - 1):
+                input_token = input_ids[:, t:t+1]
+                target_token = labels[:, t+1]
+                
+                # Forward pass with cache updates
+                # Note: valid only for models supporting past_kv (e.g. unmodified KIVI models)
+                if hasattr(model, 'module'):
+                    logits, past_kv = model.module(input_token, past_kv=past_kv, use_cache=True)
+                else:
+                    logits, past_kv = model(input_token, past_kv=past_kv, use_cache=True)
+                
+                step_logits = logits[:, -1, :]
+                
+                if (target_token != -100).any():
+                    loss = loss_fn(step_logits, target_token)
+                    total_loss += loss.item()
+                    total_tokens += (target_token != -100).sum().item()
 
     avg_loss = total_loss / max(total_tokens, 1)
     bpc = avg_loss / math.log(2)
@@ -296,9 +344,18 @@ def run_experiment(model_name: str, dataset: str, args):
 
     print("Evaluating full-precision model (no KIVI)...", flush=True)
     _set_kivi_enabled(model, False)
-    eval_fn = _evaluate_ppl_autoregressive if args.eval_mode == "autoregressive" else _evaluate_ppl
-    epoch_eval_fn = _evaluate_ppl if args.eval_mode == "autoregressive" else eval_fn
-    base_eval_fn = _evaluate_ppl if args.eval_mode == "autoregressive" else eval_fn
+    
+    if args.eval_mode == "autoregressive":
+        eval_fn = _evaluate_ppl_autoregressive
+    elif args.eval_mode == "streaming":
+        eval_fn = _evaluate_ppl_streaming
+    else:
+        eval_fn = _evaluate_ppl
+        
+    # epoch_eval_fn = _evaluate_ppl if args.eval_mode in ["autoregressive", "streaming"] else eval_fn
+    epoch_eval_fn = eval_fn
+    # base_eval_fn = _evaluate_ppl if args.eval_mode in ["autoregressive", "streaming"] else eval_fn
+    base_eval_fn = _evaluate_ppl
 
     base_loss, base_bpc, base_ppl = base_eval_fn(
         model,
@@ -349,14 +406,15 @@ def run_experiment(model_name: str, dataset: str, args):
             flush=True,
         )
 
-    if args.eval_mode == "autoregressive" and args.epochs > 0:
-        final_loss, final_bpc, final_ppl = _evaluate_ppl_autoregressive(
+    if args.eval_mode in ["autoregressive", "streaming"] and args.epochs > 0:
+        final_eval_fn = _evaluate_ppl_autoregressive if args.eval_mode == "autoregressive" else _evaluate_ppl_streaming
+        final_loss, final_bpc, final_ppl = final_eval_fn(
             model,
             val_loader,
             device,
             tokenizer.pad_token_id,
             tokenizer.vocab_size,
-            desc=f"Final AR Eval {model_name}-{dataset}",
+            desc=f"Final {args.eval_mode.capitalize()} Eval {model_name}-{dataset}",
         )
         print(
             f"[{model_name}/{dataset}] final autoregressive | val loss {final_loss:.4f} | val ppl {final_ppl:.4f}",
@@ -386,13 +444,11 @@ def parse_args():
     parser.add_argument("--v-bits", type=int, default=2)
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--residual-length", type=int, default=32)
-    parser.add_argument("--quantize-prefill", action="store_true", help="Quantize K/V during prefill (may lower PPL).")
-    parser.add_argument("--prefill-use-quantized", action="store_true", help="Use quantized K/V for attention during prefill.")
     parser.add_argument("--rope-theta", type=int, default=100000)
     parser.add_argument("--attn-implementation", type=str, default="sdpa", choices=["sdpa", "eager"])
     parser.add_argument("--output-dir", type=str, default="outputs/qat")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval-mode", choices=["batched", "autoregressive"], default="batched")
+    parser.add_argument("--eval-mode", choices=["batched", "autoregressive", "streaming"], default="batched")
     return parser.parse_args()
 
 

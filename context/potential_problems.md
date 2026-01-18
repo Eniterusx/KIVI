@@ -1,5 +1,7 @@
 # KIVI Implementation Issues Analysis
 
+# WARNING: Old file, the problems are mainly fixed in the new solution.
+
 **Status**: Confirmed after code review ✓
 
 ## Confirmed Problems
